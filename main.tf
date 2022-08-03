@@ -2,45 +2,21 @@ provider "helm" {
   kubernetes {
     host                   = var.k8s_host
     cluster_ca_certificate = base64decode(var.k8s_cluster_ca_certificate)
-    client_certificate     = base64decode(var.k8s_client_certificate)
-    client_key             = base64decode(var.k8s_client_key)
+    token                  = var.k8s_client_token
   }
 }
 
 provider "kubectl" {
   host                   = var.k8s_host
   cluster_ca_certificate = base64decode(var.k8s_cluster_ca_certificate)
-  client_certificate     = base64decode(var.k8s_client_certificate)
-  client_key             = base64decode(var.k8s_client_key)
+  token                  = var.k8s_client_token
   load_config_file       = false
 }
 
 provider "kubernetes" {
   host                   = var.k8s_host
   cluster_ca_certificate = base64decode(var.k8s_cluster_ca_certificate)
-  client_certificate     = base64decode(var.k8s_client_certificate)
-  client_key             = base64decode(var.k8s_client_key)
-}
-
-data "template_file" "cluster" {
-  template = file("${path.module}/manifests/tsb/cluster.yaml.tmpl")
-  vars = {
-    cluster_name  = var.cluster_name
-    tsb_org       = var.tsb_org
-    tier1_cluster = var.tier1_cluster
-  }
-}
-
-data "template_file" "tctl_controlplane" {
-  template = file("${path.module}/manifests/tctl/tctl-controlplane.sh.tmpl")
-  vars = {
-    cluster_name = var.cluster_name
-    tsb_mp_host  = var.tsb_mp_host
-    tsb_org      = var.tsb_org
-    tsb_tenant   = "tetrate"
-    tsb_username = var.tsb_username
-    tsb_password = var.tsb_password
-  }
+  token                  = var.k8s_client_token
 }
 
 resource "null_resource" "jumpbox_tctl" {
@@ -52,11 +28,23 @@ resource "null_resource" "jumpbox_tctl" {
     private_key = var.jumpbox_pkey
   }
   provisioner "file" {
-    content     = data.template_file.cluster.rendered
+    content = templatefile("${path.module}/manifests/tsb/cluster.yaml.tmpl", {
+      cluster_name    = var.cluster_name
+      tsb_org         = var.tsb_org
+      tier1_cluster   = var.tier1_cluster
+      locality_region = var.locality_region
+    })
     destination = "${var.cluster_name}-cluster.yaml"
   }
   provisioner "file" {
-    content     = data.template_file.tctl_controlplane.rendered
+    content = templatefile("${path.module}/manifests/tctl/tctl-controlplane.sh.tmpl", {
+      cluster_name = var.cluster_name
+      tsb_mp_host  = var.tsb_mp_host
+      tsb_org      = var.tsb_org
+      tsb_tenant   = "tetrate"
+      tsb_username = var.tsb_username
+      tsb_password = var.tsb_password
+    })
     destination = "${var.cluster_name}-tctl-controlplane.sh"
   }
 
@@ -68,19 +56,24 @@ resource "null_resource" "jumpbox_tctl" {
 
   # file-remote is not supported yet, https://github.com/hashicorp/terraform/issues/3379
   provisioner "local-exec" {
-    command = "scp -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -i ${var.name_prefix}-${var.jumpbox_username}.pem  ${var.jumpbox_username}@${var.jumpbox_host}:${var.cluster_name}-service-account.jwk ${var.cluster_name}-service-account.jwk"
+    command = "scp -oStrictHostKeyChecking=no -oIdentitiesOnly=yes -oUserKnownHostsFile=/dev/null -i ${var.output_path}/${var.name_prefix}-${var.cloud}-${var.jumpbox_username}.pem  ${var.jumpbox_username}@${var.jumpbox_host}:${var.cluster_name}-service-account.jwk ${var.output_path}/${var.cluster_name}-service-account.jwk"
   }
-
-  depends_on = [data.template_file.cluster, data.template_file.tctl_controlplane]
 }
 
 data "local_file" "service_account" {
-  filename   = "${var.cluster_name}-service-account.jwk"
+  filename   = "${var.output_path}/${var.cluster_name}-service-account.jwk"
   depends_on = [null_resource.jumpbox_tctl]
 }
-data "template_file" "controlplane_values" {
-  template = file("${path.module}/manifests/tsb/controlplane-values.yaml.tmpl")
-  vars = {
+resource "helm_release" "controlplane" {
+  name             = "controlplane"
+  repository       = var.tsb_helm_repository
+  chart            = "controlplane"
+  version          = var.tsb_helm_version
+  create_namespace = true
+  namespace        = "istio-system"
+  timeout          = 900
+
+  values = [templatefile("${path.module}/manifests/tsb/controlplane-values.yaml.tmpl", {
     registry                  = var.registry
     tsb_version               = var.tsb_version
     tsb_fqdn                  = var.tsb_fqdn
@@ -90,21 +83,7 @@ data "template_file" "controlplane_values" {
     es_host                   = var.es_host
     es_username               = var.es_username
     es_password               = var.es_password
-  }
-  depends_on = [data.local_file.service_account]
-}
-resource "helm_release" "controlplane" {
-  name                = "controlplane"
-  repository          = "https://dl.cloudsmith.io/basic/tetrate/tsb-helm/helm/charts/"
-  chart               = "controlplane"
-  version             = var.tsb_helm_version
-  create_namespace    = true
-  namespace           = "istio-system"
-  timeout             = 900
-  repository_username = var.tsb_helm_username
-  repository_password = var.tsb_helm_password
-
-  values = [data.template_file.controlplane_values.rendered]
+  })]
 
   set {
     name  = "secrets.tsb.cacert"
@@ -141,15 +120,13 @@ resource "kubernetes_secret_v1" "cacerts" {
   depends_on = [helm_release.controlplane]
 }
 resource "helm_release" "dataplane" {
-  name                = "dataplane"
-  repository          = "https://dl.cloudsmith.io/basic/tetrate/tsb-helm/helm/charts/"
-  chart               = "dataplane"
-  version             = var.tsb_helm_version
-  create_namespace    = true
-  namespace           = "istio-gateway"
-  timeout             = 900
-  repository_username = var.tsb_helm_username
-  repository_password = var.tsb_helm_password
+  name             = "dataplane"
+  repository       = var.tsb_helm_repository
+  chart            = "dataplane"
+  version          = var.tsb_helm_version
+  create_namespace = true
+  namespace        = "istio-gateway"
+  timeout          = 900
 
   set {
     name  = "image.registry"
